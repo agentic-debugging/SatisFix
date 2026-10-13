@@ -146,10 +146,14 @@ class DefaultAgent:
                 }
             )
         self.n_calls += 1
-        message = self.model.query(self.messages)
+        message = self._model_query()
         self.cost += message.get("extra", {}).get("cost", 0.0)
         self.add_messages(message)
         return message
+
+    def _model_query(self) -> dict:
+        """The model call of a step; override to send the request differently."""
+        return self.model.query(self.messages)
 
     def execute_actions(self, message: dict) -> list[dict]:
         """Execute actions in message, add observation messages, return them."""

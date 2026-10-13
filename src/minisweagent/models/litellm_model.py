@@ -61,13 +61,17 @@ class LitellmModel:
         if self.config.litellm_model_registry and Path(self.config.litellm_model_registry).is_file():
             litellm.utils.register_model(json.loads(Path(self.config.litellm_model_registry).read_text()))
 
+    def _api_kwargs(self, kwargs: dict) -> dict:
+        """`model_kwargs` overlaid with per-call kwargs."""
+        return self.config.model_kwargs | kwargs
+
     def _query(self, messages: list[dict[str, str]], **kwargs):
         try:
             return litellm.completion(
                 model=self.config.model_name,
                 messages=messages,
-                tools=[BASH_TOOL],
-                **(self.config.model_kwargs | kwargs),
+                tools=kwargs.pop("tools", [BASH_TOOL]),
+                **self._api_kwargs(kwargs),
             )
         except litellm.exceptions.AuthenticationError as e:
             e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."
@@ -78,23 +82,22 @@ class LitellmModel:
         prepared = _reorder_anthropic_thinking_blocks(prepared)
         return set_cache_control(prepared, mode=self.config.set_cache_control)
 
-    def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
+    def _call(self, messages: list[dict[str, str]], **kwargs):
+        """Send one request (with retries) and return the raw response and its cost, already counted globally."""
         for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
             with attempt:
                 response = self._query(self._prepare_messages_for_api(messages), **kwargs)
         cost_output = self._calculate_cost(response)
         GLOBAL_MODEL_STATS.add(cost_output["cost"])
+        return response, cost_output
+
+    def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
+        response, cost_output = self._call(messages, **kwargs)
         # Note: all model.query() implementations must persist the response and cost on FormatError.
         try:
             actions = self._parse_actions(response)
         except FormatError as e:
-            e.messages[0]["extra"].update(cost_output)
-            try:
-                e.messages[0]["extra"]["response"] = response.model_dump(mode="json")
-            except Exception:
-                # model_dump failed (e.g. unserializable object); fall back to repr
-                # so the spec contract ("response MUST be persisted") holds unconditionally.
-                e.messages[0]["extra"]["response"] = repr(response)
+            self._persist_on_format_error(e, response, cost_output)
             raise
         message = response.choices[0].message.model_dump()
         message["extra"] = {
@@ -104,6 +107,60 @@ class LitellmModel:
             "timestamp": time.time(),
         }
         return message
+
+    def _persist_on_format_error(self, e: FormatError, response, cost_output: dict) -> None:
+        e.messages[0]["extra"].update(cost_output)
+        try:
+            e.messages[0]["extra"]["response"] = response.model_dump(mode="json")
+        except Exception:
+            # model_dump failed (e.g. unserializable object); fall back to repr
+            # so the spec contract ("response MUST be persisted") holds unconditionally.
+            e.messages[0]["extra"]["response"] = repr(response)
+
+    def query_report(
+        self, messages: list[dict], name: str, description: str, parameters: dict, *, require: bool = True, **kwargs
+    ) -> dict:
+        """Query with the extra tool `name` beside `bash`; the same tool list in every request, so caching holds.
+
+        With `require`, `tool_choice` forces that tool and nothing is parsed as an action. Without it, the
+        `bash` calls are parsed as in `query`; a reply with only calls of tool `name` is a FormatError whose
+        messages start with the reply, so that its calls can be answered.
+        The returned message carries the calls of tool `name` in `extra["report_calls"]` as
+        `{"id", "arguments"}` (the raw arguments string), empty if the model did not call it, and
+        `extra["truncated"]`, whether the reply was cut off at the output limit.
+        """
+        tool = {"type": "function", "function": {"name": name, "description": description, "parameters": parameters}}
+        if require:
+            kwargs["tool_choice"] = {"type": "function", "function": {"name": name}}
+        response, cost_output = self._call(messages, tools=[BASH_TOOL, tool], **kwargs)
+        tool_calls = response.choices[0].message.tool_calls or []
+        message = response.choices[0].message.model_dump()
+        message["extra"] = {
+            "actions": [],
+            "report_calls": [
+                {"id": c.id, "arguments": c.function.arguments} for c in tool_calls if c.function.name == name
+            ],
+            "truncated": response.choices[0].finish_reason == "length",
+            "response": response.model_dump(),
+            **cost_output,
+            "timestamp": time.time(),
+        }
+        if not require:
+            try:
+                message["extra"]["actions"] = self._parse_actions(
+                    response, [c for c in tool_calls if c.function.name != name]
+                )
+            except FormatError as e:
+                if message["extra"]["report_calls"] and len(message["extra"]["report_calls"]) == len(tool_calls):
+                    e.messages = (message, *e.messages)
+                else:
+                    self._persist_on_format_error(e, response, cost_output)
+                raise
+        return message
+
+    def format_tool_result(self, call_id: str, content: str) -> dict:
+        """The message that answers a tool call outside of command execution."""
+        return {"role": "tool", "tool_call_id": call_id, "content": content, "extra": {}}
 
     def _calculate_cost(self, response) -> dict[str, float]:
         try:
@@ -125,9 +182,10 @@ class LitellmModel:
                 raise RuntimeError(msg) from e
         return {"cost": cost}
 
-    def _parse_actions(self, response) -> list[dict]:
+    def _parse_actions(self, response, tool_calls: list | None = None) -> list[dict]:
         """Parse tool calls from the response. Raises FormatError if unknown tool."""
-        tool_calls = response.choices[0].message.tool_calls or []
+        if tool_calls is None:
+            tool_calls = response.choices[0].message.tool_calls or []
         return parse_toolcall_actions(
             tool_calls,
             format_error_template=self.config.format_error_template,

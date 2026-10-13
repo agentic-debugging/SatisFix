@@ -4,6 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from minisweagent.exceptions import FormatError
 from minisweagent.models import GLOBAL_MODEL_STATS
 from minisweagent.models.utils.actions_text import format_observation_messages
 from minisweagent.models.utils.actions_toolcall import format_toolcall_observation_messages
@@ -11,6 +12,8 @@ from minisweagent.models.utils.actions_toolcall_response import (
     format_toolcall_observation_messages as format_response_api_observation_messages,
 )
 from minisweagent.models.utils.openai_multimodal import expand_multimodal_content
+
+NO_TOOL_CALLS = "No tool calls found in the response. Every response MUST include at least one tool call."
 
 
 def make_output(content: str, actions: list[dict], cost: float = 1.0) -> dict:
@@ -171,6 +174,26 @@ class DeterministicToolcallModel:
         GLOBAL_MODEL_STATS.add(self.config.cost_per_call)
         return output
 
+    def query_report(
+        self, messages: list[dict], name: str, description: str, parameters: dict, *, require: bool = True, **kwargs
+    ) -> dict:
+        """Next output, with its calls of tool `name` listed in `extra["report_calls"]`.
+
+        Without `require`, an output with such calls but no actions is a FormatError, as with the real models.
+        """
+        output = self.query(messages, **kwargs)
+        calls = [c for c in output.get("tool_calls") or [] if c["function"]["name"] == name]
+        output["extra"]["report_calls"] = [{"id": c["id"], "arguments": c["function"]["arguments"]} for c in calls]
+        output["extra"].setdefault("truncated", False)
+        if not require and calls and not output["extra"]["actions"]:
+            raise FormatError(
+                output, self.format_message(role="user", content=NO_TOOL_CALLS, extra={"interrupt_type": "FormatError"})
+            )
+        return output
+
+    def format_tool_result(self, call_id: str, content: str) -> dict:
+        return {"role": "tool", "tool_call_id": call_id, "content": content, "extra": {}}
+
     def format_message(self, **kwargs) -> dict:
         return expand_multimodal_content(kwargs, pattern=self.config.multimodal_regex)
 
@@ -230,6 +253,23 @@ class DeterministicResponseAPIToolcallModel:
             return self.query(messages, **kwargs)
         GLOBAL_MODEL_STATS.add(self.config.cost_per_call)
         return output
+
+    def query_report(
+        self, messages: list[dict], name: str, description: str, parameters: dict, *, require: bool = True, **kwargs
+    ) -> dict:
+        """See `DeterministicToolcallModel.query_report`."""
+        output = self.query(messages, **kwargs)
+        calls = [i for i in output.get("output") or [] if i.get("type") == "function_call" and i.get("name") == name]
+        output["extra"]["report_calls"] = [{"id": c["call_id"], "arguments": c["arguments"]} for c in calls]
+        output["extra"]["truncated"] = output.get("status") == "incomplete"
+        if not require and calls and not output["extra"]["actions"]:
+            raise FormatError(
+                output, self.format_message(role="user", content=NO_TOOL_CALLS, extra={"interrupt_type": "FormatError"})
+            )
+        return output
+
+    def format_tool_result(self, call_id: str, content: str) -> dict:
+        return {"type": "function_call_output", "call_id": call_id, "output": content, "extra": {}}
 
     def format_message(self, **kwargs) -> dict:
         """Format message in Responses API format."""

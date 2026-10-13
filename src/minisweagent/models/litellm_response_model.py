@@ -5,7 +5,6 @@ from collections.abc import Callable
 import litellm
 
 from minisweagent.exceptions import FormatError
-from minisweagent.models import GLOBAL_MODEL_STATS
 from minisweagent.models.litellm_model import LitellmModel, LitellmModelConfig
 from minisweagent.models.utils.actions_toolcall_response import (
     BASH_TOOL_RESPONSE_API,
@@ -13,7 +12,6 @@ from minisweagent.models.utils.actions_toolcall_response import (
     format_toolcall_observation_messages,
     parse_toolcall_actions_response,
 )
-from minisweagent.models.utils.retry import retry
 
 logger = logging.getLogger("litellm_response_model")
 
@@ -42,32 +40,19 @@ class LitellmResponseModel(LitellmModel):
             return litellm.responses(
                 model=self.config.model_name,
                 input=messages,
-                tools=[BASH_TOOL_RESPONSE_API],
-                **(self.config.model_kwargs | kwargs),
+                tools=kwargs.pop("tools", [BASH_TOOL_RESPONSE_API]),
+                **self._api_kwargs(kwargs),
             )
         except litellm.exceptions.AuthenticationError as e:
             e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."
             raise e
 
     def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
-        for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
-            with attempt:
-                response = self._query(self._prepare_messages_for_api(messages), **kwargs)
-        cost_output = self._calculate_cost(response)
-        GLOBAL_MODEL_STATS.add(cost_output["cost"])
+        response, cost_output = self._call(messages, **kwargs)
         try:
             actions = self._parse_actions(response)
         except FormatError as e:
-            e.messages[0]["extra"].update(cost_output)
-            # hasattr guard: litellm.responses() returns a pydantic object, but tests
-            # may inject a plain dict; dict(response) is the correct fallback in that case.
-            # Inner try: if serialization itself fails, repr() guarantees the key is always set.
-            try:
-                e.messages[0]["extra"]["response"] = (
-                    response.model_dump(mode="json") if hasattr(response, "model_dump") else dict(response)
-                )
-            except Exception:
-                e.messages[0]["extra"]["response"] = repr(response)
+            self._persist_on_format_error(e, response, cost_output)
             raise
         message = response.model_dump() if hasattr(response, "model_dump") else dict(response)
         message["extra"] = {
@@ -77,9 +62,54 @@ class LitellmResponseModel(LitellmModel):
         }
         return message
 
-    def _parse_actions(self, response) -> list[dict]:
+    def _persist_on_format_error(self, e: FormatError, response, cost_output: dict) -> None:
+        e.messages[0]["extra"].update(cost_output)
+        # hasattr guard: litellm.responses() returns a pydantic object, but tests
+        # may inject a plain dict; dict(response) is the correct fallback in that case.
+        # Inner try: if serialization itself fails, repr() guarantees the key is always set.
+        try:
+            e.messages[0]["extra"]["response"] = (
+                response.model_dump(mode="json") if hasattr(response, "model_dump") else dict(response)
+            )
+        except Exception:
+            e.messages[0]["extra"]["response"] = repr(response)
+
+    def query_report(
+        self, messages: list[dict], name: str, description: str, parameters: dict, *, require: bool = True, **kwargs
+    ) -> dict:
+        """See `LitellmModel.query_report`; same contract in the Responses API format."""
+        tool = {"type": "function", "name": name, "description": description, "parameters": parameters}
+        if require:
+            kwargs["tool_choice"] = {"type": "function", "name": name}
+        response, cost_output = self._call(messages, tools=[BASH_TOOL_RESPONSE_API, tool], **kwargs)
+        message = response.model_dump() if hasattr(response, "model_dump") else dict(response)
+        output = message.get("output") or []
+        reports = [i for i in output if i.get("type") == "function_call" and i.get("name") == name]
+        others = [i for i in output if i not in reports]
+        message["extra"] = {
+            "actions": [],
+            "report_calls": [{"id": i.get("call_id"), "arguments": i.get("arguments")} for i in reports],
+            "truncated": message.get("status") == "incomplete",
+            **cost_output,
+            "timestamp": time.time(),
+        }
+        if not require:
+            try:
+                message["extra"]["actions"] = self._parse_actions(response, others)
+            except FormatError as e:
+                if reports and not any(i.get("type") == "function_call" for i in others):
+                    e.messages = (message, *e.messages)
+                else:
+                    self._persist_on_format_error(e, response, cost_output)
+                raise
+        return message
+
+    def format_tool_result(self, call_id: str, content: str) -> dict:
+        return {"type": "function_call_output", "call_id": call_id, "output": content, "extra": {}}
+
+    def _parse_actions(self, response, output: list | None = None) -> list[dict]:
         return parse_toolcall_actions_response(
-            getattr(response, "output", []),
+            getattr(response, "output", []) if output is None else output,
             format_error_template=self.config.format_error_template,
             template_kwargs={"finish_reason": finish_reason_from_responses_api(response)},
         )
